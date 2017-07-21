@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/mholt/photobak"
+	"errors"
 )
 
 const (
@@ -182,6 +183,10 @@ func (c *Client) DownloadItemInto(item photobak.Item, w io.Writer) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP GET %s: %s", url, resp.Status)
+	}
+
 	_, err = io.Copy(w, resp.Body)
 
 	return err
@@ -280,6 +285,10 @@ func (c *Client) getFeed(endpoint string) ([]byte, error) {
 	}
 	defer res.Body.Close()
 
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.New(res.Status)
+	}
+
 	return ioutil.ReadAll(res.Body)
 }
 
@@ -337,7 +346,7 @@ func (a albumSorter) Less(i, j int) bool {
 var automaticAlbumRe = regexp.MustCompile(`^(\d+|\d{4}-\d{2}-\d{2})$`)
 
 func prioritizeAlbum(name string) int {
-	if name == "Auto Backup" {
+	if name == "Auto Backup" || name == "Автозагрузка" {
 		return 1
 	} else if strings.HasPrefix(name, "Hangout ") {
 		return 2
