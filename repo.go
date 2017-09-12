@@ -253,7 +253,7 @@ func (r *Repository) Store(saveEverything bool, checkIntegrity bool) error {
 				defer func() { <-throttle }()
 				err := r.processCollection(listedColl, ac, ctxChan, saveEverything, checkIntegrity, &collWg)
 				if err != nil {
-					log.Printf("[ERROR] processing %s: %v", listedColl.CollectionName(), err)
+					Info.Printf("[ERROR] processing %s: %v", listedColl.CollectionName(), err)
 					return
 				}
 			}(listedColl)

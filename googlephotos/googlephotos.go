@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -118,7 +117,7 @@ func (c *Client) ListCollectionItems(col photobak.Collection, itemChan chan phot
 		if err == nil {
 			break
 		}
-		log.Printf("[DEBUG] listing photos in album '%s' (attempt %d): %v", col.CollectionName(), i+1, err)
+		photobak.Info.Printf("[DEBUG] listing photos in album '%s' (attempt %d): %v", col.CollectionName(), i+1, err)
 	}
 
 	return
