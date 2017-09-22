@@ -101,15 +101,11 @@ type collection struct {
 
 // item wraps an Item with
 // vital name+path information used
-// for creating/updating one. isNew
-// is set to true if the item
-// is new and should not overwrite
-// an existing file on disk.
+// for creating one.
 type item struct {
 	Item
 	fileName    string
 	filePath    string
-	isNew       bool
 	collections map[string]struct{}
 }
 

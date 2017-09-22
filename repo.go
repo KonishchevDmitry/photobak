@@ -421,30 +421,10 @@ func (r *Repository) processItem(ctx itemContext) error {
 		return fmt.Errorf("loading item '%s' from database: %v", itemID, err)
 	}
 
-	if loadedItem == nil {
-		// we don't have it yet; download and save item.
-
-		it := item{
-			Item:        ctx.item,
-			fileName:    ctx.item.ItemName(),
-			filePath:    r.repoRelative(filepath.Join(ctx.ac.account.accountPath(), ctx.coll.dirName, ctx.item.ItemName())),
-			isNew:       true,
-			collections: map[string]struct{}{ctx.coll.CollectionID(): {}},
-		}
-
-		Info.Printf("Getting new item %s: %s", it.ItemID(), it.ItemName())
-		err = r.downloadAndSaveItem(ctx.ac.client, downloadingItem, it, ctx.coll, ctx.ac.account, ctx.saveEverything)
-		if err != nil {
-			downloadingItem.pathMu.Lock()
-			downloadingItem.remove()
-			downloadingItem.pathMu.Unlock()
-			return fmt.Errorf("downloading and saving new item: %v", err)
-		}
-	} else {
+	if loadedItem != nil {
 		// we already have this item in the DB
 
 		_, dbHas := loadedItem.Collections[ctx.coll.CollectionID()]
-		corrupted := false
 
 		if !dbHas || ctx.checkIntegrity {
 			// if we don't have it on disk as a file or in the media list file for
@@ -466,43 +446,95 @@ func (r *Repository) processItem(ctx itemContext) error {
 			}
 		}
 
-		if ctx.checkIntegrity {
+		// check etag to see if modified remotely after it was downloaded.
+		modifiedRemotely := loadedItem.ETag != ctx.item.ItemETag()
+		checksum := loadedItem.Checksum
+		corrupted := false
+
+		if ctx.checkIntegrity || modifiedRemotely {
 			// compare checksums; if different, file was corrupted or deleted.
 
-			checksum, err := r.hash(loadedItem.FilePath)
+			realChecksum, err := r.hash(loadedItem.FilePath)
 			if err != nil {
 				log.Printf("[ERROR] checking file integrity: %v", err)
-			}
+				corrupted = true
+			} else {
+				checksum = realChecksum
 
-			corrupted = err != nil || !bytes.Equal(checksum, loadedItem.Checksum)
+				if !bytes.Equal(realChecksum, loadedItem.Checksum) {
+					log.Printf("[ERROR] checksum mismatch: %s", loadedItem.FilePath)
+					corrupted = true
+				}
+			}
 		}
 
-		// also check etag to see if modified remotely after it was downloaded.
-		modifiedRemotely := loadedItem.ETag != ctx.item.ItemETag()
-
-		if corrupted || modifiedRemotely {
-			if corrupted {
-				log.Printf("[ERROR] checksum mismatch, re-downloading: %s", loadedItem.FilePath)
-			}
-			if modifiedRemotely {
-				Info.Printf("File %s modified remotely; re-downloading", loadedItem.FilePath)
-			}
-
-			it := item{
-				Item:        ctx.item,
-				fileName:    loadedItem.FileName,
-				filePath:    loadedItem.FilePath,
-				collections: loadedItem.Collections,
-				// being very careful to NOT set isNew to true ;) - this is an existing item!
-			}
-			err := r.downloadAndSaveItem(ctx.ac.client, downloadingItem, it, ctx.coll, ctx.ac.account, ctx.saveEverything)
-			if err != nil {
-				downloadingItem.pathMu.Lock()
-				downloadingItem.remove()
-				downloadingItem.pathMu.Unlock()
-				return fmt.Errorf("re-downloading and saving existing item: %v", err)
-			}
+		if corrupted {
+			log.Printf("File %s is corrupted; re-downloading", loadedItem.FilePath)
+		} else if modifiedRemotely {
+			log.Printf("File %s modified remotely; re-downloading", loadedItem.FilePath)
+		} else {
+			return nil
 		}
+
+		if err := r.removeItem(ctx.ac.account, itemID, loadedItem.FilePath, checksum); err != nil {
+			return fmt.Errorf("removing %s: %v", loadedItem.FilePath, err)
+		}
+	}
+
+	it := item{
+		Item:        ctx.item,
+		fileName:    ctx.item.ItemName(),
+		filePath:    r.repoRelative(filepath.Join(ctx.ac.account.accountPath(), ctx.coll.dirName, ctx.item.ItemName())),
+		collections: map[string]struct{}{ctx.coll.CollectionID(): {}},
+	}
+
+	Info.Printf("Getting item %s: %s", it.ItemID(), it.ItemName())
+	err = r.downloadAndSaveItem(ctx.ac.client, downloadingItem, it, ctx.coll, ctx.ac.account, ctx.saveEverything)
+	if err != nil {
+		downloadingItem.pathMu.Lock()
+		downloadingItem.remove()
+		downloadingItem.pathMu.Unlock()
+		return fmt.Errorf("downloading and saving item: %v", err)
+	}
+
+	return nil
+}
+
+func (r *Repository) removeItem(account providerAccount, itemID string, filePath string, checksum []byte) error {
+	checksumLock := r.newChecksumLocker(checksum)
+	checksumLock.Lock()
+	defer checksumLock.Unlock()
+
+	var hasReferences bool
+
+	sameItems, err := r.db.itemsWithChecksum(checksum)
+	if err != nil {
+		return err
+	}
+
+	for _, sameItem := range sameItems {
+		if bytes.Equal(sameItem.AcctKey, account.key()) && sameItem.ItemID == itemID {
+			continue
+		}
+
+		sameContent, err := r.db.loadItem(sameItem.AcctKey, sameItem.ItemID)
+		if err != nil {
+			return err
+		}
+
+		if sameContent.FilePath == filePath {
+			hasReferences = true
+			break
+		}
+	}
+
+	if err := r.db.deleteItem(account, itemID); err != nil {
+		return err
+	}
+
+	if !hasReferences {
+		Info.Printf("Removing %s", filePath)
+		os.Remove(r.fullPath(filePath))
 	}
 
 	return nil
@@ -606,6 +638,47 @@ func (w dishonestWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+type checksumLocker struct {
+	repository *Repository
+	checksum   string
+	channel    chan struct{}
+}
+
+func (l *checksumLocker) Lock() {
+	// the operations on the database are not within the same transaction,
+	// so we use a map with channels to synchronize.
+
+	l.channel = make(chan struct{})
+
+	for {
+		l.repository.itemChecksumsMu.Lock()
+		if ch, taken := l.repository.itemChecksums[l.checksum]; taken {
+			// another goroutine is processing the same content
+			// (different item) right now; wait until it is done.
+			l.repository.itemChecksumsMu.Unlock()
+			<-ch
+		} else {
+			l.repository.itemChecksums[l.checksum] = l.channel
+			l.repository.itemChecksumsMu.Unlock()
+			break
+		}
+	}
+}
+
+func (l *checksumLocker) Unlock() {
+	l.repository.itemChecksumsMu.Lock()
+	delete(l.repository.itemChecksums, l.checksum)
+	l.repository.itemChecksumsMu.Unlock()
+	close(l.channel)
+}
+
+func (r *Repository) newChecksumLocker(checksum []byte) *checksumLocker {
+	return &checksumLocker{
+		repository: r,
+		checksum:   hex.EncodeToString(checksum),
+	}
+}
+
 func (r *Repository) downloadAndSaveItem(client Client, downloadingItem *downloadingItem, it item, coll collection, pa providerAccount, saveEverything bool) error {
 	saveToMediaListFile := func(pa providerAccount, coll collection, pointedPath, itemID string) error {
 		err := r.writeToMediaListFile(coll, pointedPath)
@@ -624,15 +697,13 @@ func (r *Repository) downloadAndSaveItem(client Client, downloadingItem *downloa
 	}
 
 	downloadingItem.pathMu.Lock()
-	if it.isNew {
-		itemFileName, err := r.reserveUniqueFilename(coll.dirPath, it.ItemName(), false)
-		if err != nil {
-			downloadingItem.pathMu.Unlock()
-			return fmt.Errorf("reserving unique filename: %v", err)
-		}
-		it.fileName = itemFileName
-		it.filePath = r.repoRelative(filepath.Join(coll.dirPath, itemFileName))
+	itemFileName, err := r.reserveUniqueFilename(coll.dirPath, it.ItemName(), false)
+	if err != nil {
+		downloadingItem.pathMu.Unlock()
+		return fmt.Errorf("reserving unique filename: %v", err)
 	}
+	it.fileName = itemFileName
+	it.filePath = r.repoRelative(filepath.Join(coll.dirPath, itemFileName))
 	downloadingItem.path = r.fullPath(it.filePath)
 	downloadingItem.pathMu.Unlock()
 
@@ -712,63 +783,40 @@ func (r *Repository) downloadAndSaveItem(client Client, downloadingItem *downloa
 
 	// de-duplicate at the content level: if we already have
 	// an item with this checksum in the repository, point
-	// to it instead of saving it again. the operations on
-	// the database are not within the same transaction,
-	// so we use a map with channels to synchronize.
-	hashStr := hex.EncodeToString(dbi.Checksum)
-	hashChan := make(chan struct{})
-	for {
-		r.itemChecksumsMu.Lock()
-		if ch, taken := r.itemChecksums[hashStr]; taken {
-			// another goroutine is processing the same content
-			// (different item) right now; wait until it is done.
-			r.itemChecksumsMu.Unlock()
-			<-ch
-		} else {
-			r.itemChecksums[hashStr] = hashChan
-			r.itemChecksumsMu.Unlock()
-			break
-		}
+	// to it instead of saving it again.
+	checksumLock := r.newChecksumLocker(dbi.Checksum)
+	checksumLock.Lock()
+	defer checksumLock.Unlock()
+
+	sameItems, err := r.db.itemsWithChecksum(dbi.Checksum)
+	if err != nil {
+		return fmt.Errorf("de-duplicating item '%s': %v", it.fileName, err)
 	}
-	defer func() {
-		r.itemChecksumsMu.Lock()
-		delete(r.itemChecksums, hashStr)
-		r.itemChecksumsMu.Unlock()
-		close(hashChan)
-	}()
+	if len(sameItems) > 0 {
+		Info.Printf("The content of item %s already exists in repository; de-duplicating", it.ItemID())
 
-	// if this item is new, see if its content is unique
-	if it.isNew {
-		sameItems, err := r.db.itemsWithChecksum(dbi.Checksum)
+		// this content is not unique; it exists elsewhere in the repo.
+		// save this item to this collection, but we'll delete the
+		// hard copy of the file we just downloaded since we'll point
+		// to where it already exists in the repository.
+
+		// delete the physical copy we just downloaded
+		downloadingItem.pathMu.Lock()
+		downloadingItem.remove()
+		downloadingItem.pathMu.Unlock()
+
+		// load any item that has this checksum, they should all point to the
+		// same file path; use it to set this item's file path.
+		sameContent, err := r.db.loadItem(sameItems[0].AcctKey, sameItems[0].ItemID)
 		if err != nil {
-			return fmt.Errorf("de-duplicating item '%s': %v", it.fileName, err)
+			return err
 		}
-		if len(sameItems) > 0 {
-			Info.Printf("The content of item %s already exists in repository; de-duplicating", it.ItemID())
+		dbi.FilePath = sameContent.FilePath
 
-			// this content is not unique; it exists elsewhere in the repo.
-			// save this item to this collection, but we'll delete the
-			// hard copy of the file we just downloaded since we'll point
-			// to where it already exists in the repository.
-
-			// delete the physical copy we just downloaded
-			downloadingItem.pathMu.Lock()
-			downloadingItem.remove()
-			downloadingItem.pathMu.Unlock()
-
-			// load any item that has this checksum, they should all point to the
-			// same file path; use it to set this item's file path.
-			sameContent, err := r.db.loadItem(sameItems[0].AcctKey, sameItems[0].ItemID)
-			if err != nil {
-				return err
-			}
-			dbi.FilePath = sameContent.FilePath
-
-			// write that item's path to the media list file for this item
-			err = saveToMediaListFile(pa, coll, sameContent.FilePath, itemID)
-			if err != nil {
-				return err
-			}
+		// write that item's path to the media list file for this item
+		err = saveToMediaListFile(pa, coll, sameContent.FilePath, itemID)
+		if err != nil {
+			return err
 		}
 	}
 
