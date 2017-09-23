@@ -528,7 +528,7 @@ func (r *Repository) removeItem(account providerAccount, itemID string, filePath
 		}
 	}
 
-	if err := r.db.deleteItem(account, itemID); err != nil {
+	if err := r.db.deleteItem(account.key(), itemID); err != nil {
 		return err
 	}
 
@@ -549,20 +549,23 @@ func (r *Repository) removeItem(account providerAccount, itemID string, filePath
 func (r *Repository) reserveUniqueFilename(dir, targetName string, isDir bool) (string, error) {
 	// ensure that only one reservation takes place for this name at a time
 	targetPath := filepath.Join(dir, targetName)
-	r.itemNamesMu.Lock()
-	ch, taken := r.itemNames[targetPath]
-	if taken {
-		r.itemNamesMu.Unlock()
-		<-ch // wait for it to be available again
+	channel := make(chan struct{})
+
+	for {
 		r.itemNamesMu.Lock()
+		if ch, taken := r.itemNames[targetPath]; taken {
+			r.itemNamesMu.Unlock()
+			<-ch // wait for it to be available again
+		} else {
+			r.itemNames[targetPath] = channel
+			r.itemNamesMu.Unlock()
+			break
+		}
 	}
-	ch = make(chan struct{})
-	r.itemNames[targetPath] = ch
-	r.itemNamesMu.Unlock()
 	defer func() {
 		r.itemNamesMu.Lock()
 		delete(r.itemNames, targetPath)
-		close(ch)
+		close(channel)
 		r.itemNamesMu.Unlock()
 	}()
 
@@ -792,8 +795,34 @@ func (r *Repository) downloadAndSaveItem(client Client, downloadingItem *downloa
 	if err != nil {
 		return fmt.Errorf("de-duplicating item '%s': %v", it.fileName, err)
 	}
-	if len(sameItems) > 0 {
-		Info.Printf("The content of item %s already exists in repository; de-duplicating", it.ItemID())
+	for _, sameItem := range sameItems {
+		sameContent, err := r.db.loadItem(sameItem.AcctKey, sameItem.ItemID)
+		if err != nil {
+			return err
+		}
+
+		if !bytes.Equal(sameContent.Checksum, dbi.Checksum) {
+			log.Printf("[ERROR] %s has an invalid checksum index", sameItem.ItemID)
+			continue
+		}
+
+		if sameContent.FilePath == dbi.FilePath {
+			continue
+		}
+
+		if realChecksum, err := r.hash(sameContent.FilePath); err != nil {
+			log.Printf("[ERROR] %s item points to a corrupted %q file: %v; deleting it", sameItem.ItemID, sameContent.FilePath, err)
+			if err := r.db.deleteItem(sameItem.AcctKey, sameItem.ItemID); err != nil {
+				return err
+			}
+			continue
+		} else if !bytes.Equal(realChecksum, sameContent.Checksum) {
+			log.Printf("[ERROR] %s item points to %q file with a different checksum; deleting it", sameItem.ItemID, sameContent.FilePath)
+			if err := r.db.deleteItem(sameItem.AcctKey, sameItem.ItemID); err != nil {
+				return err
+			}
+			continue
+		}
 
 		// this content is not unique; it exists elsewhere in the repo.
 		// save this item to this collection, but we'll delete the
@@ -805,19 +834,15 @@ func (r *Repository) downloadAndSaveItem(client Client, downloadingItem *downloa
 		downloadingItem.remove()
 		downloadingItem.pathMu.Unlock()
 
-		// load any item that has this checksum, they should all point to the
-		// same file path; use it to set this item's file path.
-		sameContent, err := r.db.loadItem(sameItems[0].AcctKey, sameItems[0].ItemID)
-		if err != nil {
-			return err
-		}
+		Info.Printf("The content of item %s already exists in repository as %q; de-duplicating", it.ItemID(), sameContent.FilePath)
 		dbi.FilePath = sameContent.FilePath
 
 		// write that item's path to the media list file for this item
-		err = saveToMediaListFile(pa, coll, sameContent.FilePath, itemID)
-		if err != nil {
+		if err = saveToMediaListFile(pa, coll, sameContent.FilePath, itemID); err != nil {
 			return err
 		}
+
+		break
 	}
 
 	downloadingItem.pathMu.Lock()

@@ -212,7 +212,7 @@ func (r *Repository) deleteItem(pa providerAccount, dbc *dbCollection, dbi *dbIt
 	}
 
 	// delete item from the database
-	return r.db.deleteItem(pa, dbi.ID)
+	return r.db.deleteItem(pa.key(), dbi.ID)
 }
 
 // removeItemFromCollection removes pa's item dbi from collID.

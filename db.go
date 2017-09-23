@@ -93,15 +93,15 @@ func (db *boltDB) loadItem(acctKey []byte, itemID string) (*dbItem, error) {
 	return item, err
 }
 
-func (db *boltDB) deleteItem(acct providerAccount, itemID string) error {
+func (db *boltDB) deleteItem(acctKey []byte, itemID string) error {
 	return db.Update(func(tx *bolt.Tx) error {
-		accountBucket := tx.Bucket(acct.key())
+		accountBucket := tx.Bucket(acctKey)
 		if accountBucket == nil {
-			return fmt.Errorf("account '%s' does not exist in DB", acct)
+			return fmt.Errorf("account '%s' does not exist in DB", acctKey)
 		}
 		items := accountBucket.Bucket([]byte("items"))
 		if items == nil {
-			return fmt.Errorf("account '%s' is missing 'items' bucket", acct)
+			return fmt.Errorf("account '%s' is missing 'items' bucket", acctKey)
 		}
 		// delete from checksum index
 		var item *dbItem
@@ -109,7 +109,7 @@ func (db *boltDB) deleteItem(acct providerAccount, itemID string) error {
 		if err != nil {
 			return fmt.Errorf("loading item to get its hash: %v", err)
 		}
-		err = db.removeItemFromChecksumIndex(tx, item, acct.key())
+		err = db.removeItemFromChecksumIndex(tx, item, acctKey)
 		if err != nil {
 			return err
 		}
