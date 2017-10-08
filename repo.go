@@ -471,7 +471,7 @@ func (r *Repository) processItem(ctx itemContext) error {
 		if corrupted {
 			log.Printf("File %s is corrupted; re-downloading", loadedItem.FilePath)
 		} else if modifiedRemotely {
-			log.Printf("File %s modified remotely; re-downloading", loadedItem.FilePath)
+			Info.Printf("File %s modified remotely; re-downloading", loadedItem.FilePath)
 		} else {
 			return nil
 		}
